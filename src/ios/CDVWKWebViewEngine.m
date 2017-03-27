@@ -20,19 +20,31 @@
 #import "CDVWKWebViewEngine.h"
 #import "CDVWKWebViewUIDelegate.h"
 #import <Cordova/NSDictionary+CordovaPreferences.h>
-
+#import <MobileCoreServices/MobileCoreServices.h>
 #import <objc/message.h>
+#import "GCDWebServer.h"
 
 #define CDV_BRIDGE_NAME @"cordova"
-#define CDV_IONIC_WK @"xhr"
 #define CDV_IONIC_STOP_SCROLL @"stopScroll"
 #define CDV_WKWEBVIEW_FILE_URL_LOAD_SELECTOR @"loadFileURL:allowingReadAccessToURL:"
+
+
+@interface CDVWKWeakScriptMessageHandler : NSObject <WKScriptMessageHandler>
+
+@property (nonatomic, weak, readonly) id<WKScriptMessageHandler>scriptMessageHandler;
+
+- (instancetype)initWithScriptMessageHandler:(id<WKScriptMessageHandler>)scriptMessageHandler;
+
+@end
+
 
 @interface CDVWKWebViewEngine ()
 
 @property (nonatomic, strong, readwrite) NSOperationQueue* fileQueue;
 @property (nonatomic, strong, readwrite) UIView* engineWebView;
 @property (nonatomic, strong, readwrite) id <WKUIDelegate> uiDelegate;
+@property (nonatomic, weak) id <WKScriptMessageHandler> weakScriptMessageHandler;
+@property (nonatomic, strong) GCDWebServer *webServer;
 
 @end
 
@@ -53,6 +65,10 @@
 
         self.engineWebView = [[WKWebView alloc] initWithFrame:frame];
         self.fileQueue = [[NSOperationQueue alloc] init];
+
+        self.webServer = [[GCDWebServer alloc] init];
+        [self.webServer addGETHandlerForBasePath:@"/" directoryPath:@"/" indexFilename:nil cacheAge:3600 allowRangeRequests:YES];
+        [self.webServer startWithPort:8080 bonjourName:nil];
     }
 
     return self;
@@ -80,23 +96,23 @@
 
     self.uiDelegate = [[CDVWKWebViewUIDelegate alloc] initWithTitle:[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"]];
 
+    CDVWKWeakScriptMessageHandler *weakScriptMessageHandler = [[CDVWKWeakScriptMessageHandler alloc] initWithScriptMessageHandler:self];
+
     WKUserContentController* userContentController = [[WKUserContentController alloc] init];
-    [userContentController addScriptMessageHandler:self name:CDV_BRIDGE_NAME];
-    [userContentController addScriptMessageHandler:self name:CDV_IONIC_WK];
-    [userContentController addScriptMessageHandler:self name:CDV_IONIC_STOP_SCROLL];
+    [userContentController addScriptMessageHandler:weakScriptMessageHandler name:CDV_BRIDGE_NAME];
+    [userContentController addScriptMessageHandler:weakScriptMessageHandler name:CDV_IONIC_STOP_SCROLL];
 
     // Inject XHR Polyfill
     BOOL disableXHRPolyfill = [settings cordovaBoolSettingForKey:@"DisableXHRPolyfill" defaultValue:NO];
     if (!disableXHRPolyfill) {
         NSLog(@"CDVWKWebViewEngine: trying to inject XHR polyfill");
-        WKUserScript *xhrScript = [self xhrPolyfillScript];
-        if (xhrScript) {
-            [userContentController addUserScript:xhrScript];
+        WKUserScript *wkScript = [self wkPluginScript];
+        if (wkScript) {
+            [userContentController addUserScript:wkScript];
         }
     } else {
         NSLog(@"CDVWKWebViewEngine: skipped XHR polyfill");
     }
-
 
     WKWebViewConfiguration* configuration = [self createConfigurationFromSettings:settings];
     configuration.userContentController = userContentController;
@@ -105,6 +121,10 @@
     WKWebView* wkWebView = [[WKWebView alloc] initWithFrame:self.engineWebView.frame configuration:configuration];
     wkWebView.UIDelegate = self.uiDelegate;
     self.engineWebView = wkWebView;
+
+    if (IsAtLeastiOSVersion(@"9.0") && [self.viewController isKindOfClass:[CDVViewController class]]) {
+        wkWebView.customUserAgent = ((CDVViewController*) self.viewController).userAgent;
+    }
 
     if ([self.viewController conformsToProtocol:@protocol(WKUIDelegate)]) {
         wkWebView.UIDelegate = (id <WKUIDelegate>)self.viewController;
@@ -125,11 +145,37 @@
     // check if content thread has died on resume
     NSLog(@"%@", @"CDVWKWebViewEngine will reload WKWebView if required on resume");
     [[NSNotificationCenter defaultCenter]
-        addObserver:self
-           selector:@selector(onAppWillEnterForeground:)
-               name:UIApplicationWillEnterForegroundNotification object:nil];
+     addObserver:self
+     selector:@selector(onAppWillEnterForeground:)
+     name:UIApplicationWillEnterForegroundNotification object:nil];
 
-    NSLog(@"Using WKWebView");
+    NSLog(@"Using Ionic WKWebView");
+
+    [self addURLObserver];
+}
+
+- (void)onReset {
+    [self addURLObserver];
+}
+
+static void * KVOContext = &KVOContext;
+
+- (void)addURLObserver {
+    if(!IsAtLeastiOSVersion(@"9.0")){
+        [self.webView addObserver:self forKeyPath:@"URL" options:0 context:KVOContext];
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSString *,id> *)change context:(void *)context
+{
+    if (context == KVOContext) {
+        if (object == [self webView] && [keyPath isEqualToString: @"URL"] && [object valueForKeyPath:keyPath] == nil){
+            NSLog(@"URL is nil. Reloading WKWebView");
+            [(WKWebView*)_engineWebView reload];
+        }
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
 }
 
 - (void) onAppWillEnterForeground:(NSNotification*)notification {
@@ -167,9 +213,10 @@
 {
     if ([self canLoadRequest:request]) { // can load, differentiate between file urls and other schemes
         if (request.URL.fileURL) {
-            SEL wk_sel = NSSelectorFromString(CDV_WKWEBVIEW_FILE_URL_LOAD_SELECTOR);
-            NSURL* readAccessUrl = [request.URL URLByDeletingLastPathComponent];
-            return ((id (*)(id, SEL, id, id))objc_msgSend)(_engineWebView, wk_sel, request.URL, readAccessUrl);
+
+            NSURL *url = [[NSURL URLWithString:@"http://localhost:8080"] URLByAppendingPathComponent:request.URL.path];
+            NSURLRequest *request2 = [NSURLRequest requestWithURL:url];
+            return [(WKWebView*)_engineWebView loadRequest:request2];
         } else {
             return [(WKWebView*)_engineWebView loadRequest:request];
         }
@@ -301,17 +348,17 @@
     return self.engineWebView;
 }
 
-- (WKUserScript*)xhrPolyfillScript
+- (WKUserScript*)wkPluginScript
 {
-    NSString *scriptFile = [[NSBundle mainBundle] pathForResource:@"www/xhr" ofType:@"js"];
+    NSString *scriptFile = [[NSBundle mainBundle] pathForResource:@"www/wk-plugin" ofType:@"js"];
     if (scriptFile == nil) {
-        NSLog(@"CDVWKWebViewEngine: XHR polyfill was not found");
+        NSLog(@"CDVWKWebViewEngine: WK plugin was not found");
         return nil;
     }
     NSError *error = nil;
     NSString *source = [NSString stringWithContentsOfFile:scriptFile encoding:NSUTF8StringEncoding error:&error];
     if (source == nil || error != nil) {
-        NSLog(@"CDVWKWebViewEngine: XHR polyfill can not be loaded: %@", error);
+        NSLog(@"CDVWKWebViewEngine: WK plugin can not be loaded: %@", error);
         return nil;
     }
     return [[WKUserScript alloc] initWithSource:source
@@ -325,8 +372,6 @@
 {
     if ([message.name isEqualToString:CDV_BRIDGE_NAME]) {
         [self handleCordovaMessage: message];
-    } else if ([message.name isEqualToString:CDV_IONIC_WK]) {
-        [self handleXHRMessage: message];
     } else if ([message.name isEqualToString:CDV_IONIC_STOP_SCROLL]) {
         [self handleStopScroll];
     }
@@ -362,34 +407,6 @@
     }
 }
 
-- (void)handleXHRMessage:(WKScriptMessage *)message
-{
-    NSString *str = message.body;
-    if (!str || ![str isKindOfClass:[NSString class]] || [str length] < 4) {
-        NSLog(@"CDVWKWebViewEngine: Invalid XHR request");
-        return;
-    }
-    NSData *data = [message.body dataUsingEncoding:NSUTF8StringEncoding];
-    NSError *error = nil;
-    NSDictionary *request = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-    if (!request || error != nil) {
-        NSLog(@"CDVWKWebViewEngine: JSON response could not be parsed");
-        return;
-    }
-
-    NSNumber *reqID = request[@"id"];
-    if(!reqID || ![reqID isKindOfClass:[NSNumber class]]) {
-        NSLog(@"CDVWKWebViewEngine: XHR's ID is invalid'");
-        return;
-    }
-    NSString *url = request[@"url"];
-    if(!url || ![url isKindOfClass:[NSString class]]) {
-        NSLog(@"CDVWKWebViewEngine: XHR's URL is invalid'");
-        return;
-    }
-    [self sendXHRResponse:reqID path:url];
-}
-
 - (void)handleStopScroll
 {
     WKWebView* wkWebView = (WKWebView*)_engineWebView;
@@ -413,100 +430,6 @@
     for (UIView *child in [node subviews]) {
         [self recursiveStopScroll:child];
     }
-}
-
-- (NSURL *)xhrBaseURL
-{
-    return [[[(WKWebView*)_engineWebView URL] URLByStandardizingPath] URLByDeletingLastPathComponent];
-}
-
-
-- (NSURL *)securePathAppend:(NSString *)relativePath
-{
-    if (relativePath == nil || [relativePath length] == 0) {
-        NSLog(@"CDVWKWebViewEngine: requested path is empty");
-        return nil;
-    }
-
-    if ([relativePath isAbsolutePath]) {
-        NSLog(@"CDVWKWebViewEngine: requested path is an absolute path");
-        return nil;
-    }
-    // Remove # and ?
-    NSRange range = [relativePath rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"#?"]];
-    if(range.location != NSNotFound) {
-        relativePath = [relativePath substringToIndex:range.location];
-    }
-
-    NSURL *base = [self xhrBaseURL];
-    NSURL *final = [[base URLByAppendingPathComponent:relativePath] standardizedURL];
-
-    // Security sensitive
-    // Ensure URL does not leave the base URL
-    if (![[final absoluteString] hasPrefix:[base absoluteString]]) {
-        NSLog(@"CDVWKWebViewEngine: requested path can not be accessed: %@", final);
-        return nil;
-    }
-
-    return final;
-
-}
-
-- (void)sendXHRResponse:(NSNumber *)requestId path:(NSString *)requestPath
-{
-    [self.fileQueue addOperationWithBlock:^{
-        if (requestId == nil) {
-            NSLog(@"CDVWKWebViewEngine: requestID is empty");
-            return;
-        }
-
-        if ([requestId integerValue] <= 0) {
-            NSLog(@"CDVWKWebViewEngine: invalid requestID");
-            return;
-        }
-
-        NSLog(@"CDVWKWebViewEngine: XHR intercepted: %@", requestPath);
-
-        NSInteger requestIdInteger = [requestId integerValue];
-        NSURL *path = [self securePathAppend: requestPath];
-        if (path == nil) {
-            [self js_handleXHRError:requestIdInteger errorMessage:@"bad path"];
-            return;
-        }
-
-        NSError *error = nil;
-        NSData *source = [NSData dataWithContentsOfURL:path options:0 error:&error];
-        if (source == nil || error != nil) {
-            NSLog(@"CDVWKWebViewEngine: Error while opening file with path");
-            NSLog(@"CDVWKWebViewEngine: %@", error);
-            [self js_handleXHRError:requestIdInteger errorMessage:@"file not found"];
-            return;
-        }
-
-        NSString *content = [source base64EncodedStringWithOptions:0];
-        if (content == nil) {
-            [self js_handleXHRError:requestIdInteger errorMessage:@"file content can not be serialized. BUG!"];
-            return;
-        }
-
-        [self js_handleXHRResponse:requestIdInteger content:content];
-    }];
-}
-
-- (void) js_handleXHRResponse:(NSInteger)requestId content:(NSString *)base64
-{
-    NSString *jsCode = [NSString stringWithFormat:@"handleXHRResponse(%ld, \"%@\")",
-                        (long)requestId, base64];
-
-    [(WKWebView*)_engineWebView evaluateJavaScript:jsCode completionHandler:nil];
-}
-
-- (void) js_handleXHRError:(NSInteger)requestId errorMessage:(NSString *)message
-{
-    NSString *jsCode = [NSString stringWithFormat:@"handleXHRError(%ld, \"%@\")",
-                        (long)requestId, message];
-
-    [(WKWebView*)_engineWebView evaluateJavaScript:jsCode completionHandler:nil];
 }
 
 
@@ -609,4 +532,25 @@
         decisionHandler(WKNavigationActionPolicyCancel);
     }
 }
+
+@end
+
+#pragma mark - CDVWKWeakScriptMessageHandler
+
+@implementation CDVWKWeakScriptMessageHandler
+
+- (instancetype)initWithScriptMessageHandler:(id<WKScriptMessageHandler>)scriptMessageHandler
+{
+    self = [super init];
+    if (self) {
+        _scriptMessageHandler = scriptMessageHandler;
+    }
+    return self;
+}
+
+- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message
+{
+    [self.scriptMessageHandler userContentController:userContentController didReceiveScriptMessage:message];
+}
+
 @end
